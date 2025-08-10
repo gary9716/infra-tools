@@ -1,17 +1,18 @@
 #!/bin/bash
 
-# Usage: ./fill-env-from-task-def.sh <task-definition-json-file> [env-file] [region]
-# Example: ./fill-env-from-task-def.sh .aws/task-definition-staging.json .env ap-southeast-1
+# Usage: ./fill_env_with_task_def.sh <task-definition-json-file> [env-file] [region]
+# Example: ./fill_env_with_task_def.sh .aws/task-definition-staging.json .env
 
 set -euo pipefail
 
 JSON_FILE="$1"
 ENV_FILE="${2:-.env}"
-REGION="${3:-ap-southeast-1}"
+REGION="${3:-$(aws configure get region 2>/dev/null || echo 'ap-southeast-1')}"
 SECRET_CACHE_DIR="$(mktemp -d)"
 
 if [ -z "$JSON_FILE" ]; then
-  echo "Usage: $0 <task-definition-json-file> [region]"
+  echo "Usage: $0 <task-definition-json-file> [env-file] [region]"
+  echo "Note: If region is not specified, will use AWS default region or fallback to ap-southeast-1"
   exit 1
 fi
 
@@ -19,6 +20,8 @@ if [ ! -f "$JSON_FILE" ]; then
   echo "File not found: $JSON_FILE"
   exit 1
 fi
+
+echo "Using AWS region: $REGION" >&2
 
 # --- Collect all unique Secrets Manager ARNs across all containers ---
 SECRET_ARNS=$(jq -r '
@@ -40,7 +43,12 @@ for ARN in $SECRET_ARNS; do
   TEMP_FILE_NAME=$(echo "$ARN" | md5 | sed 's/^.*= //')
   CACHE_FILE="$SECRET_CACHE_DIR/$TEMP_FILE_NAME"
   if [ ! -f "$CACHE_FILE" ]; then
-    aws secretsmanager get-secret-value --secret-id "$ARN" --region "$REGION" --query 'SecretString' --output text > "$CACHE_FILE"
+    if ! aws secretsmanager get-secret-value --secret-id "$ARN" --region "$REGION" --query 'SecretString' --output text > "$CACHE_FILE" 2>/dev/null; then
+      echo "ERROR: Failed to retrieve secret from Secrets Manager: $ARN" >&2
+      echo "ERROR: Please check if the secret exists and you have proper permissions" >&2
+      # Create empty file to avoid further errors
+      echo "{}" > "$CACHE_FILE"
+    fi
   fi
 done
 
@@ -53,13 +61,19 @@ for PARAM in $SSM_PARAM_NAMES; do
   PARAM_BATCH+=("$PARAM")
   COUNT=$((COUNT+1))
   if [ $COUNT -eq 10 ]; then
-    aws ssm get-parameters --names "${PARAM_BATCH[@]}" --region "$REGION" --with-decryption --output json >> "$SSM_PARAM_FILE"
+    if ! aws ssm get-parameters --names "${PARAM_BATCH[@]}" --region "$REGION" --with-decryption --output json >> "$SSM_PARAM_FILE" 2>/dev/null; then
+      echo "ERROR: Failed to retrieve SSM parameters: ${PARAM_BATCH[*]}" >&2
+      echo "ERROR: Please check if the parameters exist and you have proper permissions" >&2
+    fi
     PARAM_BATCH=()
     COUNT=0
   fi
 done
 if [ ${#PARAM_BATCH[@]} -gt 0 ]; then
-  aws ssm get-parameters --names "${PARAM_BATCH[@]}" --region "$REGION" --with-decryption --output json >> "$SSM_PARAM_FILE"
+  if ! aws ssm get-parameters --names "${PARAM_BATCH[@]}" --region "$REGION" --with-decryption --output json >> "$SSM_PARAM_FILE" 2>/dev/null; then
+    echo "ERROR: Failed to retrieve SSM parameters: ${PARAM_BATCH[*]}" >&2
+    echo "ERROR: Please check if the parameters exist and you have proper permissions" >&2
+  fi
 fi
 
 jq -s '{Parameters: map(.Parameters) | add}' "$SSM_PARAM_FILE" > "$SECRET_CACHE_DIR/ssm_params_merged.json"
@@ -95,16 +109,34 @@ for ((i=0; i<CONTAINER_COUNT; i++)); do
       CACHE_FILE="$SECRET_CACHE_DIR/$TEMP_FILE_NAME"
       SECRET_JSON=$(cat "$CACHE_FILE")
       VALUE="$(echo "$SECRET_JSON" | jq -r --arg key "$SECRET_KEY" '.[$key]')"
+      
+      # Check if the secret key exists and has a value
+      if [[ "$VALUE" == "null" ]] || [[ -z "$VALUE" ]]; then
+        echo "ERROR: Secret key '$SECRET_KEY' not found or empty in Secrets Manager ARN: $BASE_ARN" >&2
+        echo "ERROR: Container: $CONTAINER_NAME, Environment Variable: $NAME" >&2
+        continue
+      fi
+      
     elif [[ "$VALUE_FROM" == arn:aws:ssm:* ]]; then
       PARAM_NAME=$(echo "$VALUE_FROM" | sed -E 's|.*:parameter/?||')
       if [[ "$PARAM_NAME" != /* ]]; then
         PARAM_NAME="/$PARAM_NAME"
       fi
-      VALUE=$(jq -r --arg name "$PARAM_NAME" '.Parameters[] | select(.Name == $name) | .Value' "$SECRET_CACHE_DIR/ssm_params_merged.json")
+      VALUE=$(jq -r --arg name "$PARAM_NAME" '.Parameters[] | select(.Name == $name) | .Value' "$SECRET_CACHE_DIR/ssm_params_merged.json" 2>/dev/null)
+      
+      # Check if the SSM parameter exists and has a value
+      if [[ "$VALUE" == "null" ]] || [[ -z "$VALUE" ]]; then
+        echo "ERROR: SSM Parameter '$PARAM_NAME' not found or empty" >&2
+        echo "ERROR: Container: $CONTAINER_NAME, Environment Variable: $NAME" >&2
+        continue
+      fi
+      
     else
-      echo "Unknown secret type for $NAME: $VALUE_FROM" >&2
+      echo "ERROR: Unknown secret type for $NAME: $VALUE_FROM" >&2
+      echo "ERROR: Container: $CONTAINER_NAME" >&2
       continue
     fi
+    
     PAIR="$NAME='$VALUE'"
     echo "$PAIR" >> "$ENV_FILE"
   done
