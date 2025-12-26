@@ -1,4 +1,5 @@
-alias awssso="~/infra-tools/aws-sso.sh"
-alias fillenv="~/infra-tools/fill-env-from-task-def.sh"
+alias awssso="~/infra-tools/scripts/aws-sso.sh"
+alias fillenv="~/infra-tools/scripts/fill-env-from-task-def.sh"
+alias excred="source ~/infra-tools/scripts/export-credentials.sh"
 alias yourapp="awssso yourapp-staging && awssso yourapp-prod"
-alias excred="source ~/infra-tools/export-credentials.sh"
+alias forward="~/infra-tools/scripts/forward-ports.sh"

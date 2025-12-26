@@ -1,3 +1,5 @@
+# this is the file located at ~/.aws/config
+
 [sso-session yourapp-sso]
 sso_start_url=https://yourapp.awsapps.com/start
 sso_region=ap-southeast-1

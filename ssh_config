@@ -1,0 +1,5 @@
+# this is the file located at ~/.ssh/config
+Host zing-staging-bastion
+    HostName bastion.staging.zing.you
+    User ec2-user
+    IdentityFile /Users/gary/.ssh/staging-zing-bastion
